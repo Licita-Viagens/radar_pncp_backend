@@ -393,11 +393,10 @@ def processar_notificacoes():
                                 lic['unidadeOrgaoMunicipioNome'], 
                                 lic['unidadeOrgaoUfSigla'],
                                 # Ajuste o link para abrir seu App ou Site corretamente
-                                f"https://finnd.com.br/licitacao/?id={lic['id']}",
+                                f"https://finnd.com.br/detalhes/{lic['numeroControlePNCP']}",   # CORRIGIR ISSOOOO
                                 dest['nome_alerta']
                             )
                             enviar_email_mailgun(dest['email_user'], dest['nome_user'], f"Oportunidade: {lic['objetoCompra'][:30]}...", html_body)
-                            logger.info(f"Email preparado para {dest['email_user']} sobre licitação {lic['id']}")
 
                 # B) Dispara Push deste item (Batch)
                 if mensagens_push_deste_item:

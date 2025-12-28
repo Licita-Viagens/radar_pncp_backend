@@ -2018,8 +2018,8 @@ def sincronizar_favoritos(uid, email, cursor):
     user_id = user_row['id']
     app.logger.info(f"FAVORITOS: Sincronizando favoritos para usuario {user_id} (PRO={user_row['is_pro']})")
     
-    # 2. Verifica Limite - 500 É um número que parece infinito para uso manual, mas protege o banco de ter milhões de linhas.
-    LIMITE_FAVORITOS = 500
+    # 2. Verifica Limite (Ex: 100)
+    LIMITE_FAVORITOS = 100
     cursor.execute("SELECT COUNT(*) as total FROM usuarios_licitacoes_favoritas WHERE usuario_id = %s", (user_id,))
     total_atual = cursor.fetchone()['total']
     
