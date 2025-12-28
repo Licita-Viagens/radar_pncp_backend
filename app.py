@@ -38,6 +38,7 @@ import json
 import traceback
 import hashlib
 from mysql.connector import pooling
+from typing import Optional, Union
 
 # =========================================================================
 # ========================= FIREBASE ======================================
@@ -57,8 +58,8 @@ def login_firebase_required(f):
         token = header.split(' ')[1]
         
         # --- LÓGICA DE CACHE ---
-        # Cria uma chave segura e curta usando hash SHA256 do token
         try:
+            # Cria chave hash curta
             token_hash = hashlib.sha256(token.encode()).hexdigest()
             cache_key = f"firebase_token_{token_hash}"
             
@@ -66,34 +67,28 @@ def login_firebase_required(f):
             cached_user_info = cache.get(cache_key)
             
             if cached_user_info:
-                # Cache HIT: Usuário já validado recentemente
                 uid = cached_user_info['uid']
                 email = cached_user_info['email']
-                # (Opcional) Descomente se quiser ver no log quando o cache funciona
-                # app.logger.info(f"Auth Cache HIT: {uid}") 
                 return f(uid, email, *args, **kwargs)
 
             # --- Cache MISS: Valida com o Google ---
             decoded_token = firebase_auth.verify_id_token(token)
-
-            # === NOVA TRAVA DE SEGURANÇA ===
+            
+            # === TRAVA DE SEGURANÇA ===
+            # Cuidado: Isso bloqueia usuários que não confirmaram e-mail!
             if not decoded_token.get('email_verified', False):
-                # Retorna 403 (Proibido) se o e-mail não foi confirmado
                 return jsonify({
-                    'erro': 'E-mail não verificado.',
+                    'erro': 'E-mail não verificado. Verifique sua caixa de entrada.',
                     'code': 'auth/email-not-verified' 
                 }), 403
-            # ===============================
+            # ==========================
             
             uid = decoded_token['uid']
             email = decoded_token.get('email', '')
             
-            # Salva no Cache por 50 minutos (3000s)
-            # Tokens duram 1h (3600s), então 50min é uma margem segura
+            # Salva no Cache por 50 min
             user_info_to_cache = {'uid': uid, 'email': email}
             cache.set(cache_key, user_info_to_cache, timeout=3000)
-            
-            # app.logger.info(f"Auth Cache MISS: {uid} (Validado e Salvo)")
             
             return f(uid, email, *args, **kwargs)
 
@@ -105,6 +100,7 @@ def login_firebase_required(f):
             return jsonify({'erro': 'Erro interno de autenticação'}), 500
             
     return decorated_function
+
 # Inicializa o Firebase (Só faz isso se ainda não tiver inicializado)
 try:
     if not firebase_admin._apps:
@@ -193,7 +189,7 @@ def log_request_info():
 limiter = Limiter(
     get_remote_address,
     app=app,
-    default_limits=["150 per 5 minutes", "40 per minute"], # Limite padrão para todas as rotas
+    default_limits=["450 per 5 minutes", "100 per minute"], # Limite padrão para todas as rotas
     storage_uri="redis://localhost:6379" # Use 'memory://' ou configure um Redis
 )
 # --- FIM DA CONFIGURAÇÃO DO RATE LIMITER ---
@@ -213,13 +209,19 @@ app.logger.info("FLASK_SECRET_KEY carregada com sucesso do ambiente.")
 ### Configuração de CORS baseada no ambiente ###
 AMBIENTE = os.getenv('AMBIENTE', 'desenvolvimento')
 
+allowed_origins = []
+
 if AMBIENTE == 'producao':
-    # Pega a string do .env e a transforma em uma lista de URLs
     allowed_origins_str = os.getenv('FRONTEND_URL_PROD', '')
-    allowed_origins = allowed_origins_str.split(',')
+    # Garante que removemos espaços em branco acidentais entre as virgulas
+    allowed_origins = [url.strip() for url in allowed_origins_str.split(',') if url.strip()]
 else:
-    # Em desenvolvimento, permita o acesso do servidor de dev do frontend
-    allowed_origins = os.getenv('FRONTEND_URL_DEV', 'http://localhost:3000')
+    # Em desenvolvimento, aceitamos uma lista padrão ou vinda do env
+    dev_urls = os.getenv('FRONTEND_URL_DEV', 'http://localhost:3000')
+    allowed_origins = [url.strip() for url in dev_urls.split(',') if url.strip()]
+
+# Logs para debug (vai aparecer no pm2 logs se der erro)
+app.logger.info(f"CORS Configurado para origens: {allowed_origins}")
 
 # Habilita o CORS apenas para as rotas da API pública, permitindo que o frontend faça requisições
 # A área /admin não precisa de CORS pois será acessada diretamente no mesmo domínio do backend.
@@ -1267,8 +1269,7 @@ class PostsView(BaseView):
                     query = """UPDATE posts SET titulo=%s, slug=%s, resumo=%s, conteudo_completo=%s, imagem_destaque=%s, categoria_id=%s, is_featured=%s WHERE id=%s"""
                     cursor.execute(query, (titulo, slug_final, resumo, conteudo_sanitizado, imagem_destaque, categoria_id, is_featured, post_id))
                 else:
-                                        
-                    # INSERT
+                    # INSERT (Corrigido o recuo aqui para alinhar com o bloco de cima)
                     query = """INSERT INTO posts (titulo, slug, resumo, conteudo_completo, autor_id, imagem_destaque, categoria_id, is_featured) 
                                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"""
                     cursor.execute(query, (titulo, slug_final, resumo, conteudo_sanitizado, current_user.id, imagem_destaque, categoria_id, is_featured))
@@ -1685,7 +1686,7 @@ class RegistroDispositivoSchema(BaseModel):
     token_push: str
     tipo_dispositivo: str  # 'mobile_android', 'mobile_ios', 'web_browser'
     # Aceita dict ou str ou None. O App geralmente manda um Objeto (dict)
-    device_info: Optional[dict | str] = None
+    device_info: Optional[Union[dict, str]] = None
 
 @app.route('/api/usuarios/sincronizar', methods=['POST'])
 @limiter.limit("20 per minute") # ISSO EVITA ABUSOS. Basicamente isso significa que um usuário pode chamar essa API no máximo 20 vezes por minuto.
@@ -1693,46 +1694,37 @@ class RegistroDispositivoSchema(BaseModel):
 @with_db_cursor # Isso injeta o cursor do DB na função.
 def api_sincronizar_usuario(uid, email, cursor):
     data = request.json
-    # Segurança defensiva: UID nunca deve vir do cliente
+    
+    # Segurança
     if 'uid' in data:
-        app.logger.warning(
-            f"SECURITY: Tentativa de envio de UID no body por {email}"
-        )
+        app.logger.warning(f"SECURITY: Tentativa de envio de UID no body por {email}")
         return jsonify({'erro': 'Campo uid não é permitido'}), 400
 
-    app.logger.info(f"SYNC USUARIO: Recebido payload de {email}") # LOG PARA DEBUG
+    app.logger.info(f"SYNC USUARIO: Recebido payload de {email}")
 
     try:
+        # Validação Pydantic (Assumindo que RegistroDispositivoSchema está importado)
         dados = RegistroDispositivoSchema(**data)
         
-        # Garante Usuário
+        # 1. Garante Usuário na Tabela status
         cursor.execute("""
             INSERT INTO usuarios_status (uid_externo, email, nome, created_at) 
             VALUES (%s, %s, %s, NOW())
             ON DUPLICATE KEY UPDATE email=VALUES(email), nome=VALUES(nome), updated_at=NOW()
         """, (uid, email, dados.nome))
         
+        # 2. Pega ID Local
         cursor.execute("SELECT id, is_pro FROM usuarios_status WHERE uid_externo = %s", (uid,))
         user_row = cursor.fetchone()
+        
+        if not user_row:
+             # Caso raríssimo onde o insert falhou silenciosamente
+             raise Exception("Falha ao recuperar ID do usuário após insert")
+
         user_id = user_row['id']
         is_pro = bool(user_row['is_pro'])
-
-        # --- LIMPEZA DE DISPOSITIVOS ANTIGOS (NOVO) ---
-        # Verifica quantos dispositivos esse usuário tem
-        cursor.execute("SELECT id FROM usuarios_dispositivos WHERE usuario_id = %s ORDER BY updated_at ASC", (user_id,))
-        devices = cursor.fetchall()
         
-        if len(devices) >= 5:
-            # Se tiver 5 ou mais, deleta o mais antigo (o primeiro da lista ordenada por ASC)
-            # Mas cuidado para não deletar o que estamos tentando inserir agora se for update
-            # Estratégia simples: Deleta o mais antigo que NÃO seja o token atual (se possível)
-            ids_para_remover = [d['id'] for d in devices[:len(devices)-4]] # Mantém os 4 mais recentes + o novo
-            if ids_para_remover:
-                format_strings = ','.join(['%s'] * len(ids_para_remover))
-                cursor.execute(f"DELETE FROM usuarios_dispositivos WHERE id IN ({format_strings})", tuple(ids_para_remover))
-                # Não commita ainda, espera o final
-        
-        # TRATAMENTO DO DEVICE INFO (JSON)
+        # 3. Tratamento JSON Device
         device_info_str = None
         if dados.device_info:
             if isinstance(dados.device_info, dict):
@@ -1740,15 +1732,30 @@ def api_sincronizar_usuario(uid, email, cursor):
             else:
                 device_info_str = str(dados.device_info)
 
-        # Atualiza Dispositivo
+        # 4. Upsert do Dispositivo Atual
         cursor.execute("""
             INSERT INTO usuarios_dispositivos (usuario_id, tipo, token_push, device_info, updated_at)
             VALUES (%s, %s, %s, %s, NOW())
             ON DUPLICATE KEY UPDATE updated_at=NOW(), device_info=VALUES(device_info), token_push=VALUES(token_push)
         """, (user_id, dados.tipo_dispositivo, dados.token_push, device_info_str))
         
+        # --- 5. LIMPEZA DE DISPOSITIVOS ANTIGOS (LOGICA SEGURA) ---
+        cursor.execute("SELECT id FROM usuarios_dispositivos WHERE usuario_id = %s ORDER BY updated_at ASC", (user_id,))
+        devices = cursor.fetchall()
+        
+        # Se tiver mais que 5, remove os excedentes (os mais antigos)
+        if len(devices) > 5:
+            qtd_para_remover = len(devices) - 5
+            ids_para_remover = [d['id'] for d in devices[:qtd_para_remover]]
+            
+            if ids_para_remover:
+                # Cria string segura para SQL IN (ex: %s, %s)
+                format_strings = ','.join(['%s'] * len(ids_para_remover))
+                sql_delete = f"DELETE FROM usuarios_dispositivos WHERE id IN ({format_strings})"
+                cursor.execute(sql_delete, tuple(ids_para_remover))
+                app.logger.info(f"SYNC CLEANUP: Removidos {len(ids_para_remover)} dispositivos antigos do user {user_id}")
+
         cursor._connection.commit()
-        app.logger.info(f"SYNC SUCESSO: Usuario {user_id} sincronizado.")
         
         return jsonify({
             "status": "sucesso", 
@@ -1757,11 +1764,12 @@ def api_sincronizar_usuario(uid, email, cursor):
         })
 
     except ValidationError as e:
-        app.logger.error(f"SYNC ERRO VALIDACAO: {e.errors()}") # Loga o erro exato
+        app.logger.error(f"SYNC ERRO VALIDACAO: {e.errors()}")
         return jsonify({'erro': "Dados inválidos", 'detalhes': e.errors()}), 400
     except Exception as e:
         app.logger.error(f"SYNC ERRO INTERNO: {e}")
         return jsonify({'erro': "Erro interno no servidor"}), 500
+
 
 # ============================================================================
 class AlertaSchema(BaseModel):
@@ -2062,43 +2070,43 @@ def remover_favorito(uid, email, cursor, pncp_id):
 def sincronizar_filtros_favoritos(uid, email, cursor):
     data = request.json or {}
     filtros_locais = data.get('filtros_locais', [])
-    app.logger.info(f"SYNC FILTROS: Recebidos {len(filtros_locais)} filtros de {email}") # LOG PARA DEBUG
+    app.logger.info(f"SYNC FILTROS: Recebidos {len(filtros_locais)} filtros de {email}")
     
-    # 1. Busca Usuario
+    # 1. Busca Usuário
     cursor.execute("SELECT id FROM usuarios_status WHERE uid_externo = %s", (uid,))
     user_row = cursor.fetchone()
-    if not user_row: return jsonify({"erro": "Usuario nao encontrado"}), 404
+    if not user_row: 
+        return jsonify({"erro": "Usuario nao encontrado"}), 404
     user_id = user_row['id']
     
-    # --- TRAVA DE SEGURANÇA (NOVO) ---
+    # --- TRAVA DE LIMITE ---
     LIMITE_FILTROS = 30 
     cursor.execute("SELECT COUNT(*) as total FROM usuarios_filtros_salvos WHERE usuario_id = %s", (user_id,))
-    total_atual = cursor.fetchone()['total']
+    res_count = cursor.fetchone()
+    total_atual = res_count['total']
 
-    # Se já tem muitos, ignoramos novos inserts (mas permitimos updates de existentes se a lógica fosse mais complexa,
-    # aqui simplificamos para bloquear se a lista enviada for inflar demais)
     espaco_livre = LIMITE_FILTROS - total_atual
     
-    if espaco_livre <= 0:
-        # Opcional: Logar tentativa de abuso
-        app.logger.warning(f"LIMITES: Usuario {user_id} atingiu limite de filtros salvos.")
-        # Não retornamos erro 400 para não quebrar o sync silencioso do app, 
-        # mas retornamos apenas o que já existe no banco.
-        pass 
-    else:
-        # Só processa até preencher o limite
-        filtros_para_processar = filtros_locais[:espaco_livre] if espaco_livre < len(filtros_locais) else filtros_locais
+    # Lógica de processamento
+    filtros_para_processar = []
 
+    if espaco_livre <= 0:
+        # Já está cheio, não adiciona novos, mas LOGA para sabermos
+        app.logger.warning(f"LIMITES: Usuario {user_id} atingiu limite ({total_atual}/{LIMITE_FILTROS}). Novos filtros ignorados.")
+    else:
+        # Se enviou mais do que cabe, corta a lista. Se enviou menos, processa tudo.
+        if len(filtros_locais) > espaco_livre:
+            filtros_para_processar = filtros_locais[:espaco_livre]
+        else:
+            filtros_para_processar = filtros_locais
+
+        # Loop de inserção SEGURO
         for f in filtros_para_processar:
-            # 2. Insere ou Atualiza os filtros que vieram do App
-            # (Upsert baseado no ID gerado)
-        
-            id_mobile = f.get('id') # ID gerado ficou por definição id_mobile (UUID), mas é o id para qualquer sistema (web,etc)
+            id_mobile = f.get('id')
             nome = f.get('nome')
-            # O 'filtros' dentro do objeto é a configuração complexa (FiltrosAplicados)
-            # Precisamos converter para string JSON para salvar no banco de texto
             config_json = json.dumps(f.get('filtros', {}))
-            app.logger.info(f"FILTROS: Sincronizando filtro favorito '{nome}' (ID Mobile: {id_mobile}) para usuario {user_id}")
+            
+            app.logger.info(f"FILTROS: Salvando '{nome}' (ID: {id_mobile})")
             
             cursor.execute("""
                 INSERT INTO usuarios_filtros_salvos (usuario_id, id_mobile, nome_filtro, configuracao_json, created_at)
@@ -2109,20 +2117,24 @@ def sincronizar_filtros_favoritos(uid, email, cursor):
                     updated_at = NOW()
             """, (user_id, id_mobile, nome, config_json))
     
+    # Commit das alterações
     cursor._connection.commit()
-    app.logger.info("SYNC FILTROS: Commit realizado com sucesso (filtros salvos).")
 
-    # 3. Retorna TODOS os filtros do banco para o App ficar igual
+    # 3. Retorna TUDO que está no banco (sincronização de volta para o app)
     cursor.execute("SELECT id_mobile, nome_filtro, configuracao_json FROM usuarios_filtros_salvos WHERE usuario_id = %s", (user_id,))
     rows = cursor.fetchall()
     
     filtros_remotos = []
     for row in rows:
-        filtros_remotos.append({
-            "id": row['id_mobile'],
-            "nome": row['nome_filtro'],
-            "filtros": json.loads(row['configuracao_json']) # Converte de volta texto p/ JSON
-        })
+        try:
+            filtros_remotos.append({
+                "id": row['id_mobile'],
+                "nome": row['nome_filtro'],
+                "filtros": json.loads(row['configuracao_json'])
+            })
+        except json.JSONDecodeError:
+            # Caso algum dado antigo no banco esteja corrompido, não quebra a API
+            continue
     
     return jsonify({
         "status": "sucesso", 
