@@ -193,7 +193,7 @@ admin = Admin(
     app,
     name='RADAR PNCP Admin',
     template_mode='bootstrap4',
-    index_view=MyAdminIndexView(name='Dashboard') # Usa sua view personalizada
+        index_view=MyAdminIndexView(name='Dashboard', template='admin/index.html') # Adicionado o template aqui
 )
 
 # Adicionar modelos ao Flask-Admin para gerenciar no painel
@@ -233,5 +233,6 @@ if __name__ == '__main__':
             db.session.commit()
             logger.info("Usuário 'admin' criado com senha 'admin123'.")
     app.run(debug=True, host='0.0.0.0', port=8080)
+
 
 
