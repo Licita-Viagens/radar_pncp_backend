@@ -2,7 +2,6 @@ import os
 import logging
 from datetime import datetime, timedelta
 from functools import wraps
-
 from flask import Flask, request, jsonify, make_response, redirect, url_for
 from flask_cors import CORS
 from flask_limiter import Limiter
@@ -10,9 +9,15 @@ from flask_limiter.util import get_remote_address
 from flask_caching import Cache
 from flask_bcrypt import Bcrypt
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
-from flask_admin import Admin
+from flask_admin import Admin, AdminIndexView
 from flask_admin.contrib.sqla import ModelView
 from flask_admin.menu import MenuLink
+
+### NOVO/CORRIGIDO: Importações para MySQL e SQLAlchemy ###
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker, scoped_session
+from sqlalchemy.ext.declarative import declarative_base
 
 # Configuração de logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -51,136 +56,103 @@ login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 
 # --- Configuração do Banco de Dados (Adaptado para MySQL da Railway) ---
+### NOVO/CORRIGIDO: Completando a configuração do MySQL ###
 # Usamos os nomes de variáveis que a Railway fornece para o MySQL
-dbconfig = {
-    'host': os.getenv('MYSQLHOST'),
-    'user': os.getenv('MYSQLUSER'),
-    'password': os.getenv('MYSQLPASSWORD'),
-    'database': os.getenv('MYSQLDATABASE'),
-    'port': int(os.getenv('MYSQLPORT', 3306)), # Padrão 3306 se não definido
-    'pool_name': 'radar_pncp_pool',
-    'pool_size': 5
-}
+DB_HOST = os.getenv('MYSQL_HOST')
+DB_PORT = os.getenv('MYSQL_PORT')
+DB_USER = os.getenv('MYSQL_USER')
+DB_PASSWORD = os.getenv('MYSQL_PASSWORD')
+DB_NAME = os.getenv('MYSQL_DATABASE')
 
-try:
-    import mysql.connector.pooling
-    connection_pool = mysql.connector.pooling.MySQLConnectionPool(**dbconfig)
+if all([DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME]):
+    DATABASE_URL = f"mysql+mysqlconnector://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False # Boa prática para evitar warnings
     logger.info("Configurado para usar MySQL da Railway.")
-    # Testar conexão inicial
-    with connection_pool.get_connection() as cnx:
-        if cnx.is_connected():
-            logger.info("Conexão inicial com MySQL bem-sucedida.")
-        else:
-            raise Exception("Conexão inicial com MySQL falhou.")
-except ImportError:
-    logger.error("ERRO CRÍTICO: mysql-connector-python não está instalado. A aplicação não pode iniciar sem o driver MySQL.")
-    raise ImportError("mysql-connector-python não encontrado. Verifique requirements.txt.")
-except Exception as e:
-    logger.error(f"ERRO CRÍTICO: Não foi possível inicializar o pool de conexão MySQL: {e}")
-    raise ValueError(f"Erro ao conectar ao MySQL. Verifique as variáveis de ambiente MYSQLHOST, MYSQLUSER, MYSQLPASSWORD, MYSQLDATABASE, MYSQLPORT: {e}")
-
-def get_db_connection():
-    return connection_pool.get_connection()
-
-# --- Configuração do Firebase (Desativado por padrão) ---
-firebase_enabled = os.getenv('FIREBASE_ENABLED', 'false').lower() == 'true'
-if firebase_enabled:
-    try:
-        import firebase_admin
-        from firebase_admin import credentials
-        cred_path = os.getenv('FIREBASE_CREDENTIALS_PATH', 'firebase_credentials.json')
-        cred = credentials.Certificate(cred_path)
-        firebase_admin.initialize_app(cred)
-        logger.info("Firebase inicializado com sucesso.")
-    except ImportError:
-        logger.error("ERRO: firebase_admin não está instalado. Firebase não será inicializado.")
-    except Exception as e:
-        logger.error(f"ERRO AO INICIAR FIREBASE: {e}")
-        # Não vamos crashar a aplicação por causa do Firebase se ele não for crítico
 else:
+    message = "ERRO CRÍTICO DE CONFIGURAÇÃO: Variáveis de ambiente do MySQL não estão totalmente definidas. Verifique MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE."
+    logger.critical(message)
+    raise ValueError(message)
+
+db = SQLAlchemy(app)
+
+# Teste de conexão inicial com o MySQL
+try:
+    with app.app_context():
+        db.engine.connect()
+    logger.info("Conexão inicial com MySQL bem-sucedida.")
+except Exception as e:
+    logger.critical(f"ERRO: Falha na conexão inicial com MySQL: {e}")
+    raise e
+
+### NOVO/CORRIGIDO: Definição do modelo para a tabela 'licitacoes' ###
+# O Flask-Admin precisa de modelos para gerenciar as tabelas
+class Licitacao(db.Model):
+    __tablename__ = 'licitacoes' # Nome da tabela no banco de dados
+    id = db.Column(db.Integer, primary_key=True)
+    numero_controle_pncp = db.Column(db.String(255), unique=True)
+    titulo = db.Column(db.Text)
+    objeto = db.Column(db.Text)
+    orgao_cnpj = db.Column(db.String(20))
+    orgao_nome = db.Column(db.String(255))
+    valor_estimado = db.Column(db.Numeric(15, 2))
+    data_abertura = db.Column(db.DateTime)
+    data_encerramento = db.Column(db.DateTime)
+    modalidade = db.Column(db.String(100))
+    uf = db.Column(db.String(2))
+    municipio = db.Column(db.String(255))
+    link_edital = db.Column(db.String(500))
+    status = db.Column(db.String(50))
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f'<Licitacao {self.titulo}>'
+
+### NOVO/CORRIGIDO: Firebase desativado (já estava no seu log, mantido) ###
+FIREBASE_ENABLED = os.getenv('FIREBASE_ENABLED', 'false').lower() == 'true'
+if not FIREBASE_ENABLED:
     logger.info("Firebase desativado via variável de ambiente FIREBASE_ENABLED.")
+# else:
+#     # Configuração do Firebase (se FIREBASE_ENABLED for 'true')
+#     try:
+#         import firebase_admin
+#         from firebase_admin import credentials, auth
+#         # Certifique-se de que o arquivo firebase_credentials.json está no caminho correto
+#         cred = credentials.Certificate("firebase_credentials.json")
+#         firebase_admin.initialize_app(cred)
+#         logger.info("Firebase inicializado com sucesso.")
+#     except Exception as e:
+#         logger.error(f"Erro ao inicializar Firebase: {e}")
+#         FIREBASE_ENABLED = False # Desativa se houver erro na inicialização
 
-# --- Modelos de Usuário para Flask-Login ---
-class User(UserMixin):
-    def __init__(self, id, username, email, is_admin=False):
-        self.id = id
-        self.username = username
-        self.email = email
-        self.is_admin = is_admin
+# --- Configuração do Flask-Login (Exemplo de Usuário) ---
+class User(UserMixin, db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password_hash = db.Column(db.String(120), nullable=False)
 
-    @staticmethod
-    def get(user_id):
-        conn = None
-        cursor = None
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor(dictionary=True) # Retorna dicionário para facilitar acesso
-            cursor.execute("SELECT id, username, email, is_admin FROM users WHERE id = %s", (user_id,))
-            user_data = cursor.fetchone()
-            if user_data:
-                return User(user_data['id'], user_data['username'], user_data['email'], user_data['is_admin'])
-            return None
-        except Exception as e:
-            logger.error(f"Erro ao buscar usuário por ID: {e}")
-            return None
-        finally:
-            if cursor: cursor.close()
-            if conn: conn.close()
+    def set_password(self, password):
+        self.password_hash = bcrypt.generate_password_hash(password).decode('utf-8')
 
-    @staticmethod
-    def get_by_username(username):
-        conn = None
-        cursor = None
-        try:
-            conn = get_db_connection()
-            cursor = conn.cursor(dictionary=True)
-            cursor.execute("SELECT id, username, email, password_hash, is_admin FROM users WHERE username = %s", (username,))
-            user_data = cursor.fetchone()
-            return user_data # Retorna todos os dados para verificação de senha
-        except Exception as e:
-            logger.error(f"Erro ao buscar usuário por username: {e}")
-            return None
-        finally:
-            if cursor: cursor.close()
-            if conn: conn.close()
+    def check_password(self, password):
+        return bcrypt.check_password_hash(self.password_hash, password)
 
 @login_manager.user_loader
 def load_user(user_id):
-    return User.get(user_id)
+    return User.query.get(int(user_id))
 
-# --- Flask-Admin ---
-admin = Admin(app, name='Radar PNCP Admin', template_mode='bootstrap4')
-
-class AuthenticatedModelView(ModelView):
-    def is_accessible(self):
-        return current_user.is_authenticated and current_user.is_admin
-
-    def inaccessible_callback(self, name, **kwargs):
-        return redirect(url_for('login', next=request.url))
-
-# Exemplo de como adicionar uma tabela para o Admin (você precisará adaptar)
-# admin.add_view(AuthenticatedModelView(User, session)) # Se User fosse um modelo SQLAlchemy
-
-# Link para o logout no Admin
-admin.add_link(MenuLink(name='Logout', url='/logout'))
-
-# --- Rotas de Autenticação ---
+# --- Rotas de Autenticação (Exemplo) ---
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    if current_user.is_authenticated:
-        return redirect(url_for('admin.index'))
-
     if request.method == 'POST':
         username = request.form['username']
         password = request.form['password']
-        user_data = User.get_by_username(username)
-
-        if user_data and bcrypt.check_password_hash(user_data['password_hash'], password):
-            user = User(user_data['id'], user_data['username'], user_data['email'], user_data['is_admin'])
+        user = User.query.filter_by(username=username).first()
+        if user and user.check_password(password):
             login_user(user)
-            return redirect(url_for('admin.index'))
-        else:
-            return "Login inválido", 401
+            return redirect(url_for('admin.index')) # Redireciona para o admin após login
+        return 'Login falhou'
     return '''
         <form method="post">
             <p><input type=text name=username></p>
@@ -195,84 +167,70 @@ def logout():
     logout_user()
     return redirect(url_for('login'))
 
-# --- Rotas da API ---
+# --- Painel Admin (Flask-Admin) ---
+### NOVO/CORRIGIDO: Sua MyAdminIndexView para resolver o erro 'stats' ###
+class MyAdminIndexView(AdminIndexView):
+    @login_required # Garante que só usuários logados acessem o admin
+    def index(self):
+        # Aqui é onde buscamos os dados para 'stats' do MySQL
+        try:
+            total_licitacoes = db.session.query(Licitacao).count()
+        except Exception as e:
+            logger.error(f"Erro ao buscar total de licitações para o admin: {e}")
+            total_licitacoes = 0 # Em caso de erro, mostra 0 para não quebrar a página
+
+        stats = {
+            "total_posts": total_licitacoes, # Usamos 'total_posts' para compatibilidade com seu template
+            # Você pode adicionar mais estatísticas aqui, por exemplo:
+            # "licitacoes_abertas": db.session.query(Licitacao).filter_by(status='aberta').count()
+        }
+
+        # Passamos a variável 'stats' para o template
+        return self.render('admin/index.html', stats=stats)
+
+# Inicialização do Flask-Admin com sua view personalizada
+admin = Admin(
+    app,
+    name='RADAR PNCP Admin',
+    template_mode='bootstrap4',
+    index_view=MyAdminIndexView(name='Dashboard') # Usa sua view personalizada
+)
+
+# Adicionar modelos ao Flask-Admin para gerenciar no painel
+admin.add_view(ModelView(User, db.session, name='Usuários'))
+admin.add_view(ModelView(Licitacao, db.session, name='Licitações')) # Adiciona o modelo Licitacao
+
+# --- Rotas da API (Exemplo) ---
 @app.route('/')
-@limiter.limit("10 per minute")
 def home():
-    return jsonify({"message": "API Radar PNCP está online!"})
+    return "Bem-vindo ao RADAR PNCP Backend!"
 
-@app.route('/editais', methods=['GET'])
-@limiter.limit("5 per minute")
-def get_editais():
-    conn = None
-    cursor = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor(dictionary=True) # Retorna dicionário para facilitar acesso
+@app.route('/api/licitacoes', methods=['GET'])
+@limiter.limit("10 per minute")
+def get_licitacoes():
+    # Exemplo de como buscar licitações do banco de dados
+    licitacoes = Licitacao.query.limit(10).all()
+    results = []
+    for licitacao in licitacoes:
+        results.append({
+            'id': licitacao.id,
+            'titulo': licitacao.titulo,
+            'objeto': licitacao.objeto,
+            'status': licitacao.status,
+            'data_abertura': licitacao.data_abertura.isoformat() if licitacao.data_abertura else None
+        })
+    return jsonify(results)
 
-        # Exemplo de query (adapte para sua tabela 'editais')
-        # Certifique-se de que sua tabela 'editais' existe no MySQL
-        query = "SELECT id, numero_controle_pncp, titulo, objeto, orgao_nome, valor_estimado, data_abertura, link_edital FROM editais LIMIT 100"
-        cursor.execute(query)
-        editais = cursor.fetchall()
-
-        editais_list = []
-        for edital in editais:
-            editais_list.append({
-                "id": edital.get('id'),
-                "numero_controle_pncp": edital.get('numero_controle_pncp'),
-                "titulo": edital.get('titulo'),
-                "objeto": edital.get('objeto'),
-                "orgao_nome": edital.get('orgao_nome'),
-                "valor_estimado": str(edital.get('valor_estimado')) if edital.get('valor_estimado') else None,
-                "data_abertura": edital.get('data_abertura').isoformat() if edital.get('data_abertura') else None,
-                "link_edital": edital.get('link_edital')
-            })
-        return jsonify(editais_list)
-    except Exception as e:
-        logger.error(f"Erro ao buscar editais: {e}")
-        return jsonify({"error": "Erro interno do servidor"}), 500
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
-
-# --- Rota para criar usuário admin (apenas para desenvolvimento/primeira configuração) ---
-@app.route('/create_admin_user', methods=['POST'])
-def create_admin_user():
-    # Esta rota deve ser protegida ou removida em produção!
-    if os.getenv('FLASK_ENV') != 'development':
-        return jsonify({"message": "Esta rota está desativada em produção."}), 403
-
-    username = request.json.get('username')
-    password = request.json.get('password')
-    email = request.json.get('email')
-
-    if not username or not password or not email:
-        return jsonify({"message": "Dados incompletos"}), 400
-
-    hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
-
-    conn = None
-    cursor = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO users (username, email, password_hash, is_admin) VALUES (%s, %s, %s, %s)",
-            (username, email, hashed_password, True)
-        )
-        conn.commit()
-        return jsonify({"message": f"Admin user {username} created"}), 201
-    except Exception as e:
-        logger.error(f"Erro ao criar usuário admin: {e}")
-        conn.rollback()
-        return jsonify({"error": "Erro ao criar usuário admin"}), 500
-    finally:
-        if cursor: cursor.close()
-        if conn: conn.close()
-
-# --- Inicialização da aplicação ---
+# --- Inicialização da Aplicação ---
 if __name__ == '__main__':
-    logger.info("Aplicação FINND iniciada")
-    app.run(host='0.0.0.0', port=int(os.getenv('PORT', 8080)))
+    with app.app_context():
+        db.create_all() # Cria as tabelas no MySQL se elas não existirem
+        # Exemplo: Criar um usuário admin se não existir
+        if not User.query.filter_by(username='admin').first():
+            admin_user = User(username='admin')
+            admin_user.set_password('admin123') # Mude para uma senha forte em produção!
+            db.session.add(admin_user)
+            db.session.commit()
+            logger.info("Usuário 'admin' criado com senha 'admin123'.")
+    app.run(debug=True, host='0.0.0.0', port=8080)
 
