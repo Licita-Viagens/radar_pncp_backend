@@ -58,11 +58,11 @@ login_manager.login_view = 'login'
 # --- Configuração do Banco de Dados (Adaptado para MySQL da Railway) ---
 ### NOVO/CORRIGIDO: Completando a configuração do MySQL ###
 # Usamos os nomes de variáveis que a Railway fornece para o MySQL
-DB_HOST = os.getenv('MYSQL_HOST')
-DB_PORT = os.getenv('MYSQL_PORT')
-DB_USER = os.getenv('MYSQL_USER')
-DB_PASSWORD = os.getenv('MYSQL_PASSWORD')
-DB_NAME = os.getenv('MYSQL_DATABASE')
+DB_HOST = os.getenv('MYSQLHOST')
+DB_PORT = os.getenv('MYSQLPORT')
+DB_USER = os.getenv('MYSQLUSER')
+DB_PASSWORD = os.getenv('MYSQLPASSWORD')
+DB_NAME = os.getenv('MYSQLDATABASE')
 
 if all([DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME]):
     DATABASE_URL = f"mysql+mysqlconnector://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
@@ -233,4 +233,5 @@ if __name__ == '__main__':
             db.session.commit()
             logger.info("Usuário 'admin' criado com senha 'admin123'.")
     app.run(debug=True, host='0.0.0.0', port=8080)
+
 
