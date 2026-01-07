@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timedelta
 from functools import wraps
 
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, request, jsonify, make_response, redirect, url_for
 from flask_cors import CORS
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
@@ -50,62 +50,37 @@ bcrypt = Bcrypt(app)
 login_manager = LoginManager(app)
 login_manager.login_view = 'login'
 
-# --- Configuração do Banco de Dados (Adaptado para PostgreSQL) ---
-db_type = os.getenv('DB_TYPE', 'postgresql').lower() # Padrão para postgresql na Railway
+# --- Configuração do Banco de Dados (Adaptado para MySQL da Railway) ---
+# Usamos os nomes de variáveis que a Railway fornece para o MySQL
+dbconfig = {
+    'host': os.getenv('MYSQLHOST'),
+    'user': os.getenv('MYSQLUSER'),
+    'password': os.getenv('MYSQLPASSWORD'),
+    'database': os.getenv('MYSQLDATABASE'),
+    'port': int(os.getenv('MYSQLPORT', 3306)), # Padrão 3306 se não definido
+    'pool_name': 'radar_pncp_pool',
+    'pool_size': 5
+}
 
-if db_type == 'postgresql':
-    import psycopg2
-    dbconfig = {
-        'host': os.getenv('DB_HOST'),
-        'user': os.getenv('DB_USER'),
-        'password': os.getenv('DB_PASSWORD'),
-        'database': os.getenv('DB_NAME'),
-        'port': int(os.getenv('DB_PORT', 5432)),
-    }
-    logger.info("Configurado para usar PostgreSQL.")
-    # Testar conexão inicial (opcional, mas bom para depuração)
-    try:
-        conn = psycopg2.connect(**dbconfig)
-        conn.close()
-        logger.info("Conexão inicial com PostgreSQL bem-sucedida.")
-    except Exception as e:
-        logger.error(f"ERRO CRÍTICO: Não foi possível conectar ao PostgreSQL no startup: {e}")
-        raise ValueError(f"Erro ao conectar ao PostgreSQL: {e}")
-
-else:
-    # Fallback para MySQL (se DB_TYPE não for 'postgresql')
-    try:
-        import mysql.connector.pooling
-        dbconfig = {
-            'host': os.getenv('DB_HOST', 'localhost'),
-            'user': os.getenv('DB_USER', 'root'),
-            'password': os.getenv('DB_PASSWORD', 'root'),
-            'database': os.getenv('DB_NAME', 'radar_pncp'),
-            'port': int(os.getenv('DB_PORT', 3306)),
-            'pool_name': 'radar_pncp_pool',
-            'pool_size': 5
-        }
-        connection_pool = mysql.connector.pooling.MySQLConnectionPool(**dbconfig)
-        logger.info("Configurado para usar MySQL.")
-    except ImportError:
-        logger.error("ERRO: mysql-connector-python não está instalado ou DB_TYPE está incorreto.")
-        raise ImportError("mysql-connector-python não encontrado. Instale ou defina DB_TYPE=postgresql.")
-    except Exception as e:
-        logger.error(f"ERRO CRÍTICO: Não foi possível inicializar o pool de conexão MySQL: {e}")
-        raise ValueError(f"Erro ao conectar ao MySQL: {e}")
+try:
+    import mysql.connector.pooling
+    connection_pool = mysql.connector.pooling.MySQLConnectionPool(**dbconfig)
+    logger.info("Configurado para usar MySQL da Railway.")
+    # Testar conexão inicial
+    with connection_pool.get_connection() as cnx:
+        if cnx.is_connected():
+            logger.info("Conexão inicial com MySQL bem-sucedida.")
+        else:
+            raise Exception("Conexão inicial com MySQL falhou.")
+except ImportError:
+    logger.error("ERRO CRÍTICO: mysql-connector-python não está instalado. A aplicação não pode iniciar sem o driver MySQL.")
+    raise ImportError("mysql-connector-python não encontrado. Verifique requirements.txt.")
+except Exception as e:
+    logger.error(f"ERRO CRÍTICO: Não foi possível inicializar o pool de conexão MySQL: {e}")
+    raise ValueError(f"Erro ao conectar ao MySQL. Verifique as variáveis de ambiente MYSQLHOST, MYSQLUSER, MYSQLPASSWORD, MYSQLDATABASE, MYSQLPORT: {e}")
 
 def get_db_connection():
-    if db_type == 'postgresql':
-        import psycopg2
-        try:
-            conn = psycopg2.connect(**dbconfig)
-            return conn
-        except Exception as e:
-            logger.error(f"Erro ao obter conexão PostgreSQL: {e}")
-            raise
-    else:
-        # Para MySQL, usa o pool existente
-        return connection_pool.get_connection()
+    return connection_pool.get_connection()
 
 # --- Configuração do Firebase (Desativado por padrão) ---
 firebase_enabled = os.getenv('FIREBASE_ENABLED', 'false').lower() == 'true'
@@ -139,11 +114,11 @@ class User(UserMixin):
         cursor = None
         try:
             conn = get_db_connection()
-            cursor = conn.cursor()
+            cursor = conn.cursor(dictionary=True) # Retorna dicionário para facilitar acesso
             cursor.execute("SELECT id, username, email, is_admin FROM users WHERE id = %s", (user_id,))
             user_data = cursor.fetchone()
             if user_data:
-                return User(user_data[0], user_data[1], user_data[2], user_data[3])
+                return User(user_data['id'], user_data['username'], user_data['email'], user_data['is_admin'])
             return None
         except Exception as e:
             logger.error(f"Erro ao buscar usuário por ID: {e}")
@@ -158,12 +133,10 @@ class User(UserMixin):
         cursor = None
         try:
             conn = get_db_connection()
-            cursor = conn.cursor()
+            cursor = conn.cursor(dictionary=True)
             cursor.execute("SELECT id, username, email, password_hash, is_admin FROM users WHERE username = %s", (username,))
             user_data = cursor.fetchone()
-            if user_data:
-                return user_data # Retorna todos os dados para verificação de senha
-            return None
+            return user_data # Retorna todos os dados para verificação de senha
         except Exception as e:
             logger.error(f"Erro ao buscar usuário por username: {e}")
             return None
@@ -185,28 +158,8 @@ class AuthenticatedModelView(ModelView):
     def inaccessible_callback(self, name, **kwargs):
         return redirect(url_for('login', next=request.url))
 
-# Adicione suas tabelas aqui para o Admin
-# Exemplo:
-# from sqlalchemy import create_engine, Column, Integer, String, Boolean
-# from sqlalchemy.orm import sessionmaker, declarative_base
-# Base = declarative_base()
-# class UserAdmin(Base):
-#     __tablename__ = 'users'
-#     id = Column(Integer, primary_key=True)
-#     username = Column(String(80), unique=True, nullable=False)
-#     email = Column(String(120), unique=True, nullable=False)
-#     is_admin = Column(Boolean, default=False)
-#     # Adicione outras colunas conforme seu esquema de banco de dados
-#
-# # Configurar SQLAlchemy para Flask-Admin (se você estiver usando ORM)
-# # Para PostgreSQL com psycopg2, você precisaria de um ORM como SQLAlchemy
-# # ou adaptar o ModelView para usar diretamente o psycopg2
-# # Exemplo de configuração SQLAlchemy para PostgreSQL:
-# # SQLALCHEMY_DATABASE_URI = f"postgresql://{dbconfig['user']}:{dbconfig['password']}@{dbconfig['host']}:{dbconfig['port']}/{dbconfig['database']}"
-# # engine = create_engine(SQLALCHEMY_DATABASE_URI)
-# # Session = sessionmaker(bind=engine)
-# # session = Session()
-# # admin.add_view(AuthenticatedModelView(UserAdmin, session))
+# Exemplo de como adicionar uma tabela para o Admin (você precisará adaptar)
+# admin.add_view(AuthenticatedModelView(User, session)) # Se User fosse um modelo SQLAlchemy
 
 # Link para o logout no Admin
 admin.add_link(MenuLink(name='Logout', url='/logout'))
@@ -222,8 +175,8 @@ def login():
         password = request.form['password']
         user_data = User.get_by_username(username)
 
-        if user_data and bcrypt.check_password_hash(user_data[3], password): # user_data[3] é o password_hash
-            user = User(user_data[0], user_data[1], user_data[2], user_data[4]) # user_data[4] é is_admin
+        if user_data and bcrypt.check_password_hash(user_data['password_hash'], password):
+            user = User(user_data['id'], user_data['username'], user_data['email'], user_data['is_admin'])
             login_user(user)
             return redirect(url_for('admin.index'))
         else:
@@ -255,24 +208,25 @@ def get_editais():
     cursor = None
     try:
         conn = get_db_connection()
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True) # Retorna dicionário para facilitar acesso
 
-        # Exemplo de query (adapte para sua tabela 'public.editais')
-        query = "SELECT id, numero_controle_pncp, titulo, objeto, orgao_nome, valor_estimado, data_abertura, link_edital FROM public.editais LIMIT 100"
+        # Exemplo de query (adapte para sua tabela 'editais')
+        # Certifique-se de que sua tabela 'editais' existe no MySQL
+        query = "SELECT id, numero_controle_pncp, titulo, objeto, orgao_nome, valor_estimado, data_abertura, link_edital FROM editais LIMIT 100"
         cursor.execute(query)
         editais = cursor.fetchall()
 
         editais_list = []
         for edital in editais:
             editais_list.append({
-                "id": edital[0],
-                "numero_controle_pncp": edital[1],
-                "titulo": edital[2],
-                "objeto": edital[3],
-                "orgao_nome": edital[4],
-                "valor_estimado": str(edital[5]) if edital[5] else None, # Converter Decimal para string
-                "data_abertura": edital[6].isoformat() if edital[6] else None,
-                "link_edital": edital[7]
+                "id": edital.get('id'),
+                "numero_controle_pncp": edital.get('numero_controle_pncp'),
+                "titulo": edital.get('titulo'),
+                "objeto": edital.get('objeto'),
+                "orgao_nome": edital.get('orgao_nome'),
+                "valor_estimado": str(edital.get('valor_estimado')) if edital.get('valor_estimado') else None,
+                "data_abertura": edital.get('data_abertura').isoformat() if edital.get('data_abertura') else None,
+                "link_edital": edital.get('link_edital')
             })
         return jsonify(editais_list)
     except Exception as e:
@@ -304,12 +258,11 @@ def create_admin_user():
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO users (username, email, password_hash, is_admin) VALUES (%s, %s, %s, %s) RETURNING id",
+            "INSERT INTO users (username, email, password_hash, is_admin) VALUES (%s, %s, %s, %s)",
             (username, email, hashed_password, True)
         )
-        user_id = cursor.fetchone()[0]
         conn.commit()
-        return jsonify({"message": f"Admin user {username} created with ID: {user_id}"}), 201
+        return jsonify({"message": f"Admin user {username} created"}), 201
     except Exception as e:
         logger.error(f"Erro ao criar usuário admin: {e}")
         conn.rollback()
